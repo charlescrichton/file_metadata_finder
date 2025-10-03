@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use strsim::jaro_winkler;
 use walkdir::WalkDir;
 
 #[derive(Parser, Debug)]
@@ -32,11 +33,16 @@ struct Args {
     /// Maximum number of rows to process for CSV and Excel files (default: 524288)
     #[arg(long, default_value_t = 524288)]
     max_rows: usize,
+
+    /// Fuzzy similarity threshold for column grouping (0.0-1.0, default: 0.8, 0 disables)
+    #[arg(long, default_value_t = 0.8)]
+    fuzzy_threshold: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SimilarityHashEntry {
     hash: u32,
+    example_columns: Vec<String>,
     sources: Vec<String>,
 }
 
@@ -47,11 +53,20 @@ struct Crc32HashEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+struct FuzzySimilarityGroup {
+    group_id: usize,
+    similarity_score: f64,
+    representative_columns: Vec<String>,
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct ScanResult {
     scan_directory: String,
     directories: Vec<DirectoryEntry>,
     column_similarity_table: Vec<SimilarityHashEntry>,
     crc32_similarity_table: Vec<Crc32HashEntry>,
+    fuzzy_similarity_groups: Vec<FuzzySimilarityGroup>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,6 +133,13 @@ fn main() -> Result<()> {
     // Build CRC32 similarity table
     let crc32_table = build_crc32_table(&entries);
 
+    // Build fuzzy similarity groups
+    let fuzzy_groups = if args.fuzzy_threshold > 0.0 {
+        build_fuzzy_similarity_groups(&entries, args.fuzzy_threshold)
+    } else {
+        Vec::new()
+    };
+
     // Create the top-level result with absolute path
     let scan_result = ScanResult {
         scan_directory: args.directory.canonicalize()
@@ -127,6 +149,7 @@ fn main() -> Result<()> {
         directories: entries,
         column_similarity_table: similarity_table,
         crc32_similarity_table: crc32_table,
+        fuzzy_similarity_groups: fuzzy_groups,
     };
 
     // Write JSON output
@@ -206,7 +229,7 @@ fn scan_directory(path: &Path, enable_hash: bool, max_rows: usize) -> Result<Vec
 }
 
 fn build_similarity_table(directories: &[DirectoryEntry]) -> Vec<SimilarityHashEntry> {
-    let mut hash_map: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut hash_map: HashMap<u32, (Vec<String>, Vec<String>)> = HashMap::new(); // (sources, example_columns)
 
     for dir_entry in directories {
         for file_details in &dir_entry.files {
@@ -214,20 +237,20 @@ fn build_similarity_table(directories: &[DirectoryEntry]) -> Vec<SimilarityHashE
             
             // Collect CSV similarity hashes
             if let Some(csv_meta) = &file_details.csv_metadata {
-                hash_map
+                let entry = hash_map
                     .entry(csv_meta.column_similarity_hash)
-                    .or_default()
-                    .push(file_path.clone());
+                    .or_insert_with(|| (Vec::new(), csv_meta.columns.clone()));
+                entry.0.push(file_path.clone());
             }
             
             // Collect Excel similarity hashes (per sheet)
             if let Some(excel_meta) = &file_details.excel_metadata {
                 for sheet in &excel_meta.sheets {
                     let sheet_source = format!("{} ({})", file_path, sheet.sheet_name);
-                    hash_map
+                    let entry = hash_map
                         .entry(sheet.column_similarity_hash)
-                        .or_default()
-                        .push(sheet_source);
+                        .or_insert_with(|| (Vec::new(), sheet.columns.clone()));
+                    entry.0.push(sheet_source);
                 }
             }
         }
@@ -236,8 +259,12 @@ fn build_similarity_table(directories: &[DirectoryEntry]) -> Vec<SimilarityHashE
     // Convert to sorted vector, only including hashes with multiple sources
     let mut similarity_table: Vec<SimilarityHashEntry> = hash_map
         .into_iter()
-        .filter(|(_, sources)| sources.len() > 1)  // Only show hashes with multiple sources
-        .map(|(hash, sources)| SimilarityHashEntry { hash, sources })
+        .filter(|(_, (sources, _))| sources.len() > 1)  // Only show hashes with multiple sources
+        .map(|(hash, (sources, example_columns))| SimilarityHashEntry { 
+            hash, 
+            example_columns,
+            sources 
+        })
         .collect();
     
     similarity_table.sort_by_key(|entry| entry.hash);
@@ -270,6 +297,115 @@ fn build_crc32_table(directories: &[DirectoryEntry]) -> Vec<Crc32HashEntry> {
     
     crc32_table.sort_by(|a, b| a.hash.cmp(&b.hash));
     crc32_table
+}
+
+fn build_fuzzy_similarity_groups(directories: &[DirectoryEntry], threshold: f64) -> Vec<FuzzySimilarityGroup> {
+    // Collect all column sets with their sources
+    let mut column_sets: Vec<(Vec<String>, String)> = Vec::new();
+    
+    for dir_entry in directories {
+        for file_details in &dir_entry.files {
+            let file_path = format!("{}/{}", dir_entry.path, file_details.name);
+            
+            // Collect CSV columns
+            if let Some(csv_meta) = &file_details.csv_metadata {
+                column_sets.push((csv_meta.columns.clone(), file_path.clone()));
+            }
+            
+            // Collect Excel columns (per sheet)
+            if let Some(excel_meta) = &file_details.excel_metadata {
+                for sheet in &excel_meta.sheets {
+                    let sheet_source = format!("{} ({})", file_path, sheet.sheet_name);
+                    column_sets.push((sheet.columns.clone(), sheet_source));
+                }
+            }
+        }
+    }
+    
+    if column_sets.len() < 2 {
+        return Vec::new();
+    }
+    
+    // Group similar column sets using clustering approach
+    let mut groups: Vec<FuzzySimilarityGroup> = Vec::new();
+    let mut used_indices: Vec<bool> = vec![false; column_sets.len()];
+    let mut group_id = 0;
+    
+    for i in 0..column_sets.len() {
+        if used_indices[i] {
+            continue;
+        }
+        
+        let mut group_sources = vec![column_sets[i].1.clone()];
+        let mut group_columns = column_sets[i].0.clone();
+        used_indices[i] = true;
+        
+        // Find similar column sets
+        for j in (i + 1)..column_sets.len() {
+            if used_indices[j] {
+                continue;
+            }
+            
+            let similarity = calculate_column_set_similarity(&column_sets[i].0, &column_sets[j].0);
+            if similarity >= threshold {
+                group_sources.push(column_sets[j].1.clone());
+                // Merge columns (union for representative set)
+                for col in &column_sets[j].0 {
+                    if !group_columns.contains(col) {
+                        group_columns.push(col.clone());
+                    }
+                }
+                used_indices[j] = true;
+            }
+        }
+        
+        // Only create groups with multiple sources
+        if group_sources.len() > 1 {
+            group_columns.sort();
+            groups.push(FuzzySimilarityGroup {
+                group_id,
+                similarity_score: threshold,
+                representative_columns: group_columns,
+                sources: group_sources,
+            });
+            group_id += 1;
+        }
+    }
+    
+    groups
+}
+
+fn calculate_column_set_similarity(set1: &[String], set2: &[String]) -> f64 {
+    if set1.is_empty() && set2.is_empty() {
+        return 1.0;
+    }
+    if set1.is_empty() || set2.is_empty() {
+        return 0.0;
+    }
+    
+    // Use Jaccard similarity as base, enhanced with fuzzy string matching
+    let mut matches = 0;
+    
+    for col1 in set1 {
+        let mut best_match = 0.0;
+        for col2 in set2 {
+            let similarity = jaro_winkler(col1, col2);
+            if similarity > best_match {
+                best_match = similarity;
+            }
+        }
+        if best_match > 0.8 {  // Individual column similarity threshold
+            matches += 1;
+        }
+    }
+    
+    // Calculate fuzzy Jaccard: matches / union_size
+    let union_size = set1.len() + set2.len() - matches;
+    if union_size == 0 {
+        1.0
+    } else {
+        matches as f64 / union_size as f64
+    }
 }
 
 fn is_supported_file_type(path: &Path) -> bool {

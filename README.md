@@ -12,6 +12,7 @@ A Rust-based command-line tool that recursively scans directories to extract fil
 - **Dataset similarity detection**: Column similarity hash for CSV/Excel files to identify structurally similar datasets
 - **Column similarity table**: Maps similarity hashes to files/sheets that share the same column structure
 - **CRC32 similarity table**: Maps CRC32 hashes to files with identical content for duplicate detection
+- **Fuzzy similarity grouping**: Groups datasets with similar but not identical column names using fuzzy string matching
 - **Row count limiting**: Configurable maximum rows to process (default: 524,288) with `stopped_row_count_at` indicator
 - **Multi-format support:**
   - CSV files: Extracts column names, row count, and column similarity hash
@@ -140,6 +141,15 @@ cargo build --release --target x86_64-unknown-linux-musl
 # Limit rows to 1000 for very large files
 .\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --max-rows 1000
 
+# Enable fuzzy similarity grouping with threshold 0.8 (default)
+.\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --fuzzy-threshold 0.8
+
+# Strict fuzzy similarity grouping (only very similar column names)
+.\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --fuzzy-threshold 0.9
+
+# Disable fuzzy similarity grouping
+.\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --fuzzy-threshold 0
+
 # Show all columns (unlimited)
 .\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --max-columns 0
 
@@ -162,6 +172,15 @@ cargo build --release --target x86_64-unknown-linux-musl
 # Limit rows to 1000 for very large files
 ./file_metadata_finder --directory /path/to/data --output results.json --max-rows 1000
 
+# Enable fuzzy similarity grouping with threshold 0.8 (default)
+./file_metadata_finder --directory /path/to/data --output results.json --fuzzy-threshold 0.8
+
+# Strict fuzzy similarity grouping (only very similar column names)
+./file_metadata_finder --directory /path/to/data --output results.json --fuzzy-threshold 0.9
+
+# Disable fuzzy similarity grouping
+./file_metadata_finder --directory /path/to/data --output results.json --fuzzy-threshold 0
+
 # Show all columns (unlimited)
 ./file_metadata_finder --directory /path/to/data --output results.json --max-columns 0
 
@@ -176,6 +195,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 - `--disable-hash`: Disable CRC32 hash calculation (default: enabled for files ≤ 128KB)
 - `--max-rows <NUMBER>`: Maximum rows to process for CSV/Excel files (default: 524,288)
 - `--max-columns <NUMBER>`: Maximum columns to output for CSV/Excel files (0 = unlimited, default: 255)
+- `--fuzzy-threshold <NUMBER>`: Fuzzy similarity threshold for column grouping (0.0-1.0, default: 0.8, 0 disables)
 
 ## Path Handling
 
@@ -247,6 +267,7 @@ The tool produces a JSON file with the following structure:
   "column_similarity_table": [
     {
       "hash": 288347173,
+      "example_columns": ["ID", "Name", "Value"],
       "sources": [
         "/path/to/directory/large_dataset.csv",
         "/path/to/directory/data_[REDACTED].xlsx (Sheet1)"
@@ -259,6 +280,24 @@ The tool produces a JSON file with the following structure:
       "sources": [
         "/path/to/directory/document1.pdf",
         "/path/to/directory/document_copy.pdf"
+      ]
+    }
+  ],
+  "fuzzy_similarity_groups": [
+    {
+      "group_id": 0,
+      "similarity_score": 0.8,
+      "representative_columns": [
+        "cust_id",
+        "cust_name", 
+        "customer_id",
+        "customer_name",
+        "user_id",
+        "user_name"
+      ],
+      "sources": [
+        "/path/to/directory/customers.csv",
+        "/path/to/directory/users.csv"
       ]
     }
   ]
@@ -328,6 +367,7 @@ The output includes a `column_similarity_table` that maps similarity hashes to t
 
 #### Features:
 - Only shows hashes with multiple sources (similar datasets)
+- Includes example columns from the first file with that structure
 - For Excel files, includes sheet name in source description
 - Sources are listed as file paths or "file (sheet)" format
 - Table is sorted by hash value for consistency
@@ -337,6 +377,7 @@ The output includes a `column_similarity_table` that maps similarity hashes to t
 "column_similarity_table": [
   {
     "hash": 288347173,
+    "example_columns": ["name", "age", "city"],
     "sources": [
       "./data1.csv",
       "./data2.csv",
@@ -383,12 +424,60 @@ The output includes a `crc32_similarity_table` that maps CRC32 hashes to files w
 ]
 ```
 
+### Fuzzy Similarity Groups
+
+The output includes a `fuzzy_similarity_groups` array that groups datasets with similar but not identical column structures:
+
+#### Purpose:
+- Identifies datasets with related column schemas using fuzzy string matching
+- Groups files with similar naming conventions (e.g., "customer_id" vs "cust_id")
+- Helps discover related datasets across different systems or time periods
+- Supports schema evolution analysis and data integration planning
+
+#### Features:
+- Uses Jaro-Winkler similarity for fuzzy string matching of column names
+- Configurable similarity threshold (0.0-1.0, default: 0.8)
+- Only shows groups with multiple sources (similar datasets)
+- Representative columns show union of all columns in the group
+- Groups are assigned sequential IDs for reference
+
+#### Similarity Algorithm:
+1. **Individual Column Matching**: Uses Jaro-Winkler similarity (threshold: 0.8)
+   - "customer_name" ↔ "cust_name" = high similarity
+   - "user_id" ↔ "customer_id" = moderate similarity
+2. **Set Similarity**: Modified Jaccard similarity using fuzzy matches
+3. **Clustering**: Groups datasets that exceed the overall threshold
+
+#### Threshold Guidelines:
+- **0.9+**: Very strict (only minor abbreviations: "cust_id" ↔ "customer_id")
+- **0.8**: Default (moderate similarity: related concepts with different naming)
+- **0.6-0.7**: Lenient (broader concept matching: "id" fields, "name" fields)
+- **0.0**: Disabled (no fuzzy grouping performed)
+
+#### Example Output:
+```json
+"fuzzy_similarity_groups": [
+  {
+    "group_id": 0,
+    "similarity_score": 0.8,
+    "representative_columns": [
+      "cust_id", "cust_name", "customer_id", "customer_name"
+    ],
+    "sources": [
+      "./old_system/customers.csv",
+      "./new_system/cust_data.csv"
+    ]
+  }
+]
+```
+
 ### Field Descriptions
 
 - **`scan_directory`**: Absolute path of the directory that was scanned
 - **`directories`**: Array of directories containing matching files
 - **`column_similarity_table`**: Array of similarity hash mappings showing datasets with identical column structures
 - **`crc32_similarity_table`**: Array of CRC32 hash mappings showing files with identical content
+- **`fuzzy_similarity_groups`**: Array of groups containing datasets with similar but not identical column structures
 - **`created`**: File creation timestamp in simplified format (YYYY-MM-DDTHH:MM)
 - **`crc32_hash`**: Present for files ≤ 128KB (default behavior). 8-character hexadecimal CRC32 hash
 - **`file_size`**: Present for files > 128KB or when `--disable-hash` is used. Size in bytes
