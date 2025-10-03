@@ -10,6 +10,9 @@ A Rust-based command-line tool that recursively scans directories to extract fil
 - **Smart file filtering**: Only processes supported file types (CSV, Excel, PDF, DOCX, EML)
 - **File integrity checking**: CRC32 hash calculation for files ≤ 128KB (enabled by default, larger files report size)
 - **Dataset similarity detection**: Column similarity hash for CSV/Excel files to identify structurally similar datasets
+- **Column similarity table**: Maps similarity hashes to files/sheets that share the same column structure
+- **CRC32 similarity table**: Maps CRC32 hashes to files with identical content for duplicate detection
+- **Row count limiting**: Configurable maximum rows to process (default: 524,288) with `stopped_row_count_at` indicator
 - **Multi-format support:**
   - CSV files: Extracts column names, row count, and column similarity hash
   - Excel files (.xlsx, .xls, .xlsm, .xlsb): Extracts per-sheet column names (with smart header detection in first 5 rows), row counts, and column similarity hash
@@ -23,6 +26,36 @@ A Rust-based command-line tool that recursively scans directories to extract fil
   - Sheet names
 - **JSON output**: Flat array of directory objects with file details (excludes directories with no matching files)
 - **Simplified timestamps**: Date and time in YYYY-MM-DDTHH:MM format
+
+## 🔒 Safety Assurance
+
+**This tool is completely read-only and will never modify, delete, or alter any scanned files.**
+
+### Technical Guarantees:
+
+- **Read-Only Operations**: All file access uses read-only operations (`File::open`, `fs::metadata`)
+- **No Write Operations**: The only file write operation is creating the output JSON file (specified by `--output`)
+- **Immutable Processing**: File contents are only read into memory for analysis, never modified
+- **Safe Libraries**: Uses trusted Rust libraries:
+  - `calamine` for Excel reading (read-only)
+  - `csv` crate with `ReaderBuilder` (read-only)
+  - `std::fs::metadata` for file properties (read-only)
+  - `walkdir` for directory traversal (read-only)
+
+### What the tool does:
+✅ Reads file metadata (creation time, size)  
+✅ Reads file contents for hash calculation  
+✅ Parses CSV/Excel headers and row counts  
+✅ Creates a separate JSON output file  
+
+### What the tool never does:
+❌ Modifies any scanned files  
+❌ Deletes any files  
+❌ Creates files in scanned directories  
+❌ Changes file permissions or attributes  
+❌ Moves or renames files  
+
+The tool is designed for safe analysis of sensitive data environments where file integrity is paramount.
 
 ## Installation
 
@@ -95,11 +128,20 @@ cargo build --release --target x86_64-unknown-linux-musl
 ### On Windows (PowerShell 7 or Command Prompt)
 
 ```powershell
-# Basic scan with default settings (CRC32 hash enabled for files ≤ 128KB)
+# Basic scan with default settings (CRC32 hash enabled, max 255 columns, max 524,288 rows)
 .\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json"
 
 # Disable CRC32 hash calculation (only report file sizes)
 .\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --disable-hash
+
+# Limit columns to 10 for large datasets
+.\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --max-columns 10
+
+# Limit rows to 1000 for very large files
+.\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --max-rows 1000
+
+# Show all columns (unlimited)
+.\file_metadata_finder.exe --directory "C:\Users\YourName\Documents" --output "scan_results.json" --max-columns 0
 
 # Scan a different drive
 .\file_metadata_finder.exe --directory "D:\MyData" --output "metadata.json"
@@ -108,11 +150,20 @@ cargo build --release --target x86_64-unknown-linux-musl
 ### On macOS/Linux
 
 ```bash
-# Basic scan with default settings (CRC32 hash enabled for files ≤ 128KB)
+# Basic scan with default settings (CRC32 hash enabled, max 255 columns, max 524,288 rows)
 ./file_metadata_finder --directory /path/to/data --output results.json
 
 # Disable CRC32 hash calculation (only report file sizes)
 ./file_metadata_finder --directory /path/to/data --output results.json --disable-hash
+
+# Limit columns to 10 for large datasets
+./file_metadata_finder --directory /path/to/data --output results.json --max-columns 10
+
+# Limit rows to 1000 for very large files
+./file_metadata_finder --directory /path/to/data --output results.json --max-rows 1000
+
+# Show all columns (unlimited)
+./file_metadata_finder --directory /path/to/data --output results.json --max-columns 0
 
 # Scan with default output file
 ./file_metadata_finder --directory /path/to/data
@@ -123,12 +174,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 - `-d, --directory <PATH>`: Directory to scan (required)
 - `-o, --output <OUTPUT_FILE>`: Output JSON file path (default: "output.json")
 - `--disable-hash`: Disable CRC32 hash calculation (default: enabled for files ≤ 128KB)
-
-### Arguments
-
-- `-d, --directory <PATH>`: Directory to scan (required)
-- `-o, --output <OUTPUT_FILE>`: Output JSON file path (default: "output.json")
-- `--enable-hash`: Enable CRC32 hash calculation for files ≤ 128KB (larger files report size only)
+- `--max-rows <NUMBER>`: Maximum rows to process for CSV/Excel files (default: 524,288)
+- `--max-columns <NUMBER>`: Maximum columns to output for CSV/Excel files (0 = unlimited, default: 255)
 
 ## Path Handling
 
@@ -161,6 +208,18 @@ The tool produces a JSON file with the following structure:
           }
         },
         {
+          "name": "large_dataset.csv",
+          "created": "2025-10-03T13:40",
+          "file_type": "csv",
+          "crc32_hash": "a1b2c3d4",
+          "csv_metadata": {
+            "columns": ["ID", "Name", "Value"],
+            "row_count": 1000,
+            "column_similarity_hash": 288347173,
+            "stopped_row_count_at": 1000
+          }
+        },
+        {
           "name": "data_[REDACTED].xlsx",
           "created": "2025-10-03T13:41",
           "file_type": "excel",
@@ -184,19 +243,157 @@ The tool produces a JSON file with the following structure:
         }
       ]
     }
+  ],
+  "column_similarity_table": [
+    {
+      "hash": 288347173,
+      "sources": [
+        "/path/to/directory/large_dataset.csv",
+        "/path/to/directory/data_[REDACTED].xlsx (Sheet1)"
+      ]
+    }
+  ],
+  "crc32_similarity_table": [
+    {
+      "hash": "08d6a686",
+      "sources": [
+        "/path/to/directory/document1.pdf",
+        "/path/to/directory/document_copy.pdf"
+      ]
+    }
   ]
 }
+```
+
+### Column Limiting
+
+The tool supports intelligent column limiting for CSV and Excel files to handle large datasets:
+
+#### Settings:
+- **Default**: 255 columns maximum
+- **Unlimited**: Use `--max-columns 0` to show all columns
+- **Custom limit**: Use `--max-columns N` where N is your desired limit
+
+#### Excel "Column1" Detection Rule:
+To prevent Excel libraries from outputting invented column names, the tool automatically stops outputting columns if:
+- Column position is 4 or greater (index ≥ 3), AND
+- Column name is exactly "Column1"
+
+This prevents output like: `["Real1", "Real2", "Real3", "Real4", "Column1", "Column2", "Column3"]`
+And produces: `["Real1", "Real2", "Real3", "Real4"]`
+
+#### Examples:
+```bash
+# Limit to 10 columns for large datasets
+./file_metadata_finder --directory /data --max-columns 10
+
+# Show all columns, but still apply "Column1" rule
+./file_metadata_finder --directory /data --max-columns 0
+
+# Use default limit of 255 columns
+./file_metadata_finder --directory /data
+```
+
+### Row Limiting
+
+To handle very large files efficiently, the tool supports configurable row limiting:
+
+#### Settings:
+- **Default**: 524,288 rows maximum (1024 * 512)
+- **Custom limit**: Use `--max-rows N` where N is your desired limit
+- **No limit**: Currently not supported (use a very large number if needed)
+
+#### Behavior:
+- When a file exceeds the row limit, processing stops at the limit
+- The `stopped_row_count_at` field is added to indicate where processing stopped
+- Row counting excludes header rows for accurate data row counts
+
+#### Examples:
+```bash
+# Limit to 1000 rows for very large files
+./file_metadata_finder --directory /data --max-rows 1000
+
+# Use default limit of 524,288 rows
+./file_metadata_finder --directory /data
+```
+
+### Column Similarity Table
+
+The output includes a `column_similarity_table` that maps similarity hashes to their source files/sheets:
+
+#### Purpose:
+- Identifies datasets with identical column structures
+- Helps find related or duplicate data schemas
+- Supports data governance and catalog management
+
+#### Features:
+- Only shows hashes with multiple sources (similar datasets)
+- For Excel files, includes sheet name in source description
+- Sources are listed as file paths or "file (sheet)" format
+- Table is sorted by hash value for consistency
+
+#### Example Output:
+```json
+"column_similarity_table": [
+  {
+    "hash": 288347173,
+    "sources": [
+      "./data1.csv",
+      "./data2.csv",
+      "./workbook.xlsx (Sheet1)"
+    ]
+  }
+]
+```
+
+### CRC32 Similarity Table
+
+The output includes a `crc32_similarity_table` that maps CRC32 hashes to files with identical content:
+
+#### Purpose:
+- Identifies files with identical content (exact duplicates)
+- Helps detect duplicate files across different directories
+- Supports deduplication and storage optimization
+- Works across all file types that have CRC32 hashes calculated
+
+#### Features:
+- Only shows hashes with multiple sources (duplicate files)
+- Only includes files ≤ 128KB (files with CRC32 hashes calculated)
+- Sources are listed as file paths
+- Table is sorted alphabetically by hash value for consistency
+
+#### Example Output:
+```json
+"crc32_similarity_table": [
+  {
+    "hash": "08d6a686",
+    "sources": [
+      "./documents/report.pdf",
+      "./backup/report_copy.pdf"
+    ]
+  },
+  {
+    "hash": "1a2b3c4d",
+    "sources": [
+      "./data/dataset1.csv",
+      "./archive/dataset1_backup.csv",
+      "./temp/dataset1_temp.csv"
+    ]
+  }
+]
 ```
 
 ### Field Descriptions
 
 - **`scan_directory`**: Absolute path of the directory that was scanned
 - **`directories`**: Array of directories containing matching files
-
+- **`column_similarity_table`**: Array of similarity hash mappings showing datasets with identical column structures
+- **`crc32_similarity_table`**: Array of CRC32 hash mappings showing files with identical content
 - **`created`**: File creation timestamp in simplified format (YYYY-MM-DDTHH:MM)
 - **`crc32_hash`**: Present for files ≤ 128KB (default behavior). 8-character hexadecimal CRC32 hash
 - **`file_size`**: Present for files > 128KB or when `--disable-hash` is used. Size in bytes
 - **`column_similarity_hash`**: Present for CSV and Excel files. CRC32 hash of processed column names (lowercase, alphanumeric only, sorted) to identify structurally similar datasets
+- **`stopped_row_count_at`**: Present when row limiting is applied. Indicates the number of rows processed before stopping
 - **File type metadata**: Additional fields (like `csv_metadata`, `excel_metadata`) are included based on file type
 
 ### File Filtering

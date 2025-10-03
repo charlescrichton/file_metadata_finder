@@ -28,12 +28,30 @@ struct Args {
     /// Disable CRC32 hash calculation for files <= 128KB (hash is enabled by default)
     #[arg(long, default_value_t = false)]
     disable_hash: bool,
+
+    /// Maximum number of rows to process for CSV and Excel files (default: 524288)
+    #[arg(long, default_value_t = 524288)]
+    max_rows: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SimilarityHashEntry {
+    hash: u32,
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Crc32HashEntry {
+    hash: String,
+    sources: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ScanResult {
     scan_directory: String,
     directories: Vec<DirectoryEntry>,
+    column_similarity_table: Vec<SimilarityHashEntry>,
+    crc32_similarity_table: Vec<Crc32HashEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -63,6 +81,8 @@ struct CsvMetadata {
     columns: Vec<String>,
     row_count: usize,
     column_similarity_hash: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopped_row_count_at: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,6 +96,8 @@ struct SheetMetadata {
     columns: Vec<String>,
     row_count: usize,
     column_similarity_hash: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopped_row_count_at: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -88,7 +110,13 @@ fn main() -> Result<()> {
     println!("Scanning directory: {:?}", args.directory);
     println!("Output file: {:?}", args.output);
 
-    let entries = scan_directory(&args.directory, !args.disable_hash)?;
+    let entries = scan_directory(&args.directory, !args.disable_hash, args.max_rows)?;
+
+    // Build column similarity table
+    let similarity_table = build_similarity_table(&entries);
+
+    // Build CRC32 similarity table
+    let crc32_table = build_crc32_table(&entries);
 
     // Create the top-level result with absolute path
     let scan_result = ScanResult {
@@ -97,6 +125,8 @@ fn main() -> Result<()> {
             .display()
             .to_string(),
         directories: entries,
+        column_similarity_table: similarity_table,
+        crc32_similarity_table: crc32_table,
     };
 
     // Write JSON output
@@ -114,7 +144,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn scan_directory(path: &Path, enable_hash: bool) -> Result<Vec<DirectoryEntry>> {
+fn scan_directory(path: &Path, enable_hash: bool, max_rows: usize) -> Result<Vec<DirectoryEntry>> {
     let mut dir_map: HashMap<PathBuf, Vec<FileDetails>> = HashMap::new();
 
     // First pass: count files for progress bar
@@ -150,7 +180,7 @@ fn scan_directory(path: &Path, enable_hash: bool) -> Result<Vec<DirectoryEntry>>
 
         pb.set_message(format!("Processing: {}", file_path.display()));
 
-        if let Ok(file_details) = process_file(file_path, enable_hash) {
+        if let Ok(file_details) = process_file(file_path, enable_hash, max_rows) {
             dir_map.entry(parent_dir).or_default().push(file_details);
         }
 
@@ -175,6 +205,73 @@ fn scan_directory(path: &Path, enable_hash: bool) -> Result<Vec<DirectoryEntry>>
     Ok(entries)
 }
 
+fn build_similarity_table(directories: &[DirectoryEntry]) -> Vec<SimilarityHashEntry> {
+    let mut hash_map: HashMap<u32, Vec<String>> = HashMap::new();
+
+    for dir_entry in directories {
+        for file_details in &dir_entry.files {
+            let file_path = format!("{}/{}", dir_entry.path, file_details.name);
+            
+            // Collect CSV similarity hashes
+            if let Some(csv_meta) = &file_details.csv_metadata {
+                hash_map
+                    .entry(csv_meta.column_similarity_hash)
+                    .or_default()
+                    .push(file_path.clone());
+            }
+            
+            // Collect Excel similarity hashes (per sheet)
+            if let Some(excel_meta) = &file_details.excel_metadata {
+                for sheet in &excel_meta.sheets {
+                    let sheet_source = format!("{} ({})", file_path, sheet.sheet_name);
+                    hash_map
+                        .entry(sheet.column_similarity_hash)
+                        .or_default()
+                        .push(sheet_source);
+                }
+            }
+        }
+    }
+
+    // Convert to sorted vector, only including hashes with multiple sources
+    let mut similarity_table: Vec<SimilarityHashEntry> = hash_map
+        .into_iter()
+        .filter(|(_, sources)| sources.len() > 1)  // Only show hashes with multiple sources
+        .map(|(hash, sources)| SimilarityHashEntry { hash, sources })
+        .collect();
+    
+    similarity_table.sort_by_key(|entry| entry.hash);
+    similarity_table
+}
+
+fn build_crc32_table(directories: &[DirectoryEntry]) -> Vec<Crc32HashEntry> {
+    let mut hash_map: HashMap<String, Vec<String>> = HashMap::new();
+
+    for dir_entry in directories {
+        for file_details in &dir_entry.files {
+            let file_path = format!("{}/{}", dir_entry.path, file_details.name);
+            
+            // Collect CRC32 hashes (only for files that have them)
+            if let Some(crc32_hash) = &file_details.crc32_hash {
+                hash_map
+                    .entry(crc32_hash.clone())
+                    .or_default()
+                    .push(file_path);
+            }
+        }
+    }
+
+    // Convert to sorted vector, only including hashes with multiple sources
+    let mut crc32_table: Vec<Crc32HashEntry> = hash_map
+        .into_iter()
+        .filter(|(_, sources)| sources.len() > 1)  // Only show hashes with multiple sources
+        .map(|(hash, sources)| Crc32HashEntry { hash, sources })
+        .collect();
+    
+    crc32_table.sort_by(|a, b| a.hash.cmp(&b.hash));
+    crc32_table
+}
+
 fn is_supported_file_type(path: &Path) -> bool {
     if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
         matches!(
@@ -186,7 +283,7 @@ fn is_supported_file_type(path: &Path) -> bool {
     }
 }
 
-fn process_file(path: &Path, enable_hash: bool) -> Result<FileDetails> {
+fn process_file(path: &Path, enable_hash: bool, max_rows: usize) -> Result<FileDetails> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -225,13 +322,13 @@ fn process_file(path: &Path, enable_hash: bool) -> Result<FileDetails> {
     match extension.as_str() {
         "csv" => {
             file_details.file_type = Some("csv".to_string());
-            if let Ok(csv_meta) = extract_csv_metadata(path) {
+            if let Ok(csv_meta) = extract_csv_metadata(path, max_rows) {
                 file_details.csv_metadata = Some(csv_meta);
             }
         }
         "xlsx" | "xls" | "xlsm" | "xlsb" => {
             file_details.file_type = Some("excel".to_string());
-            if let Ok(excel_meta) = extract_excel_metadata(path) {
+            if let Ok(excel_meta) = extract_excel_metadata(path, max_rows) {
                 file_details.excel_metadata = Some(excel_meta);
             }
         }
@@ -298,13 +395,24 @@ fn calculate_column_similarity_hash(columns: &[String]) -> u32 {
     hasher.finalize()
 }
 
-fn extract_csv_metadata(path: &Path) -> Result<CsvMetadata> {
+fn extract_csv_metadata(path: &Path, max_rows: usize) -> Result<CsvMetadata> {
     let mut reader = ReaderBuilder::new().has_headers(true).from_path(path)?;
 
     let headers = reader.headers()?.clone();
     let columns: Vec<String> = headers.iter().map(redact_nhs_numbers).collect();
 
-    let row_count = reader.records().count();
+    let mut row_count = 0;
+    let mut stopped_at = None;
+    
+    for record in reader.records() {
+        if record.is_ok() {
+            row_count += 1;
+            if row_count >= max_rows {
+                stopped_at = Some(row_count);
+                break;
+            }
+        }
+    }
 
     let similarity_hash = calculate_column_similarity_hash(&columns);
 
@@ -312,22 +420,31 @@ fn extract_csv_metadata(path: &Path) -> Result<CsvMetadata> {
         columns,
         row_count,
         column_similarity_hash: similarity_hash,
+        stopped_row_count_at: stopped_at,
     })
 }
 
-fn extract_excel_metadata(path: &Path) -> Result<ExcelMetadata> {
+fn extract_excel_metadata(path: &Path, max_rows: usize) -> Result<ExcelMetadata> {
     let mut workbook = open_workbook_auto(path)?;
     let mut sheets = Vec::new();
 
     for sheet_name in workbook.sheet_names().to_vec() {
         if let Ok(range) = workbook.worksheet_range(&sheet_name) {
             let (columns, header_row_idx) = extract_excel_columns_with_header_row(&range);
-            // Row count should exclude header rows - count from where headers were found
-            let row_count = if range.height() > header_row_idx + 1 {
+            
+            // Calculate actual data rows (excluding header)
+            let total_data_rows = if range.height() > header_row_idx + 1 {
                 range.height() - header_row_idx - 1
             } else {
                 0
             };
+            
+            let (row_count, stopped_at) = if total_data_rows > max_rows {
+                (max_rows, Some(max_rows))
+            } else {
+                (total_data_rows, None)
+            };
+            
             let similarity_hash = calculate_column_similarity_hash(&columns);
 
             sheets.push(SheetMetadata {
@@ -335,6 +452,7 @@ fn extract_excel_metadata(path: &Path) -> Result<ExcelMetadata> {
                 columns,
                 row_count,
                 column_similarity_hash: similarity_hash,
+                stopped_row_count_at: stopped_at,
             });
         }
     }
