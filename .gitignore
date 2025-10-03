@@ -1,1 +1,12 @@
 /target
+
+# Test files
+test_*.json
+test_*.csv
+test_*.xlsx
+test_*.bin
+*_test.json
+*_test.csv
+final_test.*
+similarity_test.*
+large_test_file.*

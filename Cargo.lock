@@ -314,6 +314,7 @@ dependencies = [
  "calamine",
  "chrono",
  "clap",
+ "crc32fast",
  "csv",
  "indicatif",
  "regex",

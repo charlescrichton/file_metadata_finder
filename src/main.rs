@@ -2,13 +2,14 @@ use anyhow::{Context, Result};
 use calamine::{open_workbook_auto, Data, Range, Reader};
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use crc32fast::Hasher;
 use csv::ReaderBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use walkdir::WalkDir;
@@ -23,6 +24,16 @@ struct Args {
     /// Output JSON file path
     #[arg(short, long, default_value = "output.json")]
     output: PathBuf,
+
+    /// Disable CRC32 hash calculation for files <= 128KB (hash is enabled by default)
+    #[arg(long, default_value_t = false)]
+    disable_hash: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ScanResult {
+    scan_directory: String,
+    directories: Vec<DirectoryEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,6 +49,10 @@ struct FileDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     file_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    file_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crc32_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     csv_metadata: Option<CsvMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
     excel_metadata: Option<ExcelMetadata>,
@@ -47,6 +62,7 @@ struct FileDetails {
 struct CsvMetadata {
     columns: Vec<String>,
     row_count: usize,
+    column_similarity_hash: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +75,7 @@ struct SheetMetadata {
     sheet_name: String,
     columns: Vec<String>,
     row_count: usize,
+    column_similarity_hash: u32,
 }
 
 fn main() -> Result<()> {
@@ -71,24 +88,33 @@ fn main() -> Result<()> {
     println!("Scanning directory: {:?}", args.directory);
     println!("Output file: {:?}", args.output);
 
-    let entries = scan_directory(&args.directory)?;
+    let entries = scan_directory(&args.directory, !args.disable_hash)?;
+
+    // Create the top-level result with absolute path
+    let scan_result = ScanResult {
+        scan_directory: args.directory.canonicalize()
+            .unwrap_or_else(|_| args.directory.clone())
+            .display()
+            .to_string(),
+        directories: entries,
+    };
 
     // Write JSON output
-    let json = serde_json::to_string_pretty(&entries)?;
+    let json = serde_json::to_string_pretty(&scan_result)?;
     let mut file = File::create(&args.output)
         .context(format!("Failed to create output file: {:?}", args.output))?;
     file.write_all(json.as_bytes())?;
 
     println!(
         "\nCompleted! Found {} directories with files.",
-        entries.len()
+        scan_result.directories.len()
     );
     println!("Output written to: {:?}", args.output);
 
     Ok(())
 }
 
-fn scan_directory(path: &Path) -> Result<Vec<DirectoryEntry>> {
+fn scan_directory(path: &Path, enable_hash: bool) -> Result<Vec<DirectoryEntry>> {
     let mut dir_map: HashMap<PathBuf, Vec<FileDetails>> = HashMap::new();
 
     // First pass: count files for progress bar
@@ -96,6 +122,7 @@ fn scan_directory(path: &Path) -> Result<Vec<DirectoryEntry>> {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
+        .filter(|e| is_supported_file_type(e.path()))
         .count();
 
     println!("Found {} files to process", file_count);
@@ -113,6 +140,7 @@ fn scan_directory(path: &Path) -> Result<Vec<DirectoryEntry>> {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
+        .filter(|e| is_supported_file_type(e.path()))
     {
         let file_path = entry.path();
         let parent_dir = file_path
@@ -122,7 +150,7 @@ fn scan_directory(path: &Path) -> Result<Vec<DirectoryEntry>> {
 
         pb.set_message(format!("Processing: {}", file_path.display()));
 
-        if let Ok(file_details) = process_file(file_path) {
+        if let Ok(file_details) = process_file(file_path, enable_hash) {
             dir_map.entry(parent_dir).or_default().push(file_details);
         }
 
@@ -131,9 +159,10 @@ fn scan_directory(path: &Path) -> Result<Vec<DirectoryEntry>> {
 
     pb.finish_with_message("Processing complete");
 
-    // Convert to output format
+    // Convert to output format, excluding directories with no files
     let mut entries: Vec<DirectoryEntry> = dir_map
         .into_iter()
+        .filter(|(_, files)| !files.is_empty())
         .map(|(path, files)| DirectoryEntry {
             path: redact_nhs_numbers(&path.display().to_string()),
             files,
@@ -146,7 +175,18 @@ fn scan_directory(path: &Path) -> Result<Vec<DirectoryEntry>> {
     Ok(entries)
 }
 
-fn process_file(path: &Path) -> Result<FileDetails> {
+fn is_supported_file_type(path: &Path) -> bool {
+    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+        matches!(
+            extension.to_lowercase().as_str(),
+            "csv" | "xlsx" | "xls" | "xlsm" | "xlsb" | "pdf" | "docx" | "eml"
+        )
+    } else {
+        false
+    }
+}
+
+fn process_file(path: &Path, enable_hash: bool) -> Result<FileDetails> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -155,6 +195,16 @@ fn process_file(path: &Path) -> Result<FileDetails> {
     let redacted_name = redact_nhs_numbers(&file_name);
 
     let created = get_creation_time(path)?;
+    let metadata = fs::metadata(path)?;
+    let file_size = metadata.len();
+
+    // Calculate hash for files <= 128KB, otherwise just store file size
+    const MAX_HASH_SIZE: u64 = 128 * 1024; // 128KB
+    let (hash_value, size_value) = if enable_hash && file_size <= MAX_HASH_SIZE {
+        (Some(calculate_crc32(path)?), None)
+    } else {
+        (None, Some(file_size))
+    };
 
     let extension = path
         .extension()
@@ -166,6 +216,8 @@ fn process_file(path: &Path) -> Result<FileDetails> {
         name: redacted_name,
         created,
         file_type: None,
+        file_size: size_value,
+        crc32_hash: hash_value,
         csv_metadata: None,
         excel_metadata: None,
     };
@@ -173,11 +225,15 @@ fn process_file(path: &Path) -> Result<FileDetails> {
     match extension.as_str() {
         "csv" => {
             file_details.file_type = Some("csv".to_string());
-            file_details.csv_metadata = extract_csv_metadata(path).ok();
+            if let Ok(csv_meta) = extract_csv_metadata(path) {
+                file_details.csv_metadata = Some(csv_meta);
+            }
         }
         "xlsx" | "xls" | "xlsm" | "xlsb" => {
             file_details.file_type = Some("excel".to_string());
-            file_details.excel_metadata = extract_excel_metadata(path).ok();
+            if let Ok(excel_meta) = extract_excel_metadata(path) {
+                file_details.excel_metadata = Some(excel_meta);
+            }
         }
         "pdf" => {
             file_details.file_type = Some("pdf".to_string());
@@ -202,7 +258,44 @@ fn get_creation_time(path: &Path) -> Result<String> {
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     let datetime: DateTime<Utc> = created.into();
-    Ok(datetime.to_rfc3339())
+    Ok(datetime.format("%Y-%m-%dT%H:%M").to_string())
+}
+
+fn calculate_crc32(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Hasher::new();
+    let mut buffer = [0; 8192]; // 8KB buffer for reading
+
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(format!("{:08x}", hasher.finalize()))
+}
+
+fn calculate_column_similarity_hash(columns: &[String]) -> u32 {
+    // Process column names: lowercase, remove non-alphanumeric, filter empty, sort
+    let mut processed_columns: Vec<String> = columns
+        .iter()
+        .map(|col| {
+            col.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        })
+        .filter(|col| !col.is_empty())
+        .collect();
+
+    processed_columns.sort();
+    let concatenated = processed_columns.join(",");
+
+    let mut hasher = Hasher::new();
+    hasher.update(concatenated.as_bytes());
+    hasher.finalize()
 }
 
 fn extract_csv_metadata(path: &Path) -> Result<CsvMetadata> {
@@ -213,7 +306,13 @@ fn extract_csv_metadata(path: &Path) -> Result<CsvMetadata> {
 
     let row_count = reader.records().count();
 
-    Ok(CsvMetadata { columns, row_count })
+    let similarity_hash = calculate_column_similarity_hash(&columns);
+
+    Ok(CsvMetadata {
+        columns,
+        row_count,
+        column_similarity_hash: similarity_hash,
+    })
 }
 
 fn extract_excel_metadata(path: &Path) -> Result<ExcelMetadata> {
@@ -222,13 +321,20 @@ fn extract_excel_metadata(path: &Path) -> Result<ExcelMetadata> {
 
     for sheet_name in workbook.sheet_names().to_vec() {
         if let Ok(range) = workbook.worksheet_range(&sheet_name) {
-            let columns = extract_excel_columns(&range);
-            let row_count = range.height();
+            let (columns, header_row_idx) = extract_excel_columns_with_header_row(&range);
+            // Row count should exclude header rows - count from where headers were found
+            let row_count = if range.height() > header_row_idx + 1 {
+                range.height() - header_row_idx - 1
+            } else {
+                0
+            };
+            let similarity_hash = calculate_column_similarity_hash(&columns);
 
             sheets.push(SheetMetadata {
                 sheet_name: redact_nhs_numbers(&sheet_name),
                 columns,
                 row_count,
+                column_similarity_hash: similarity_hash,
             });
         }
     }
@@ -236,11 +342,12 @@ fn extract_excel_metadata(path: &Path) -> Result<ExcelMetadata> {
     Ok(ExcelMetadata { sheets })
 }
 
-fn extract_excel_columns(range: &Range<Data>) -> Vec<String> {
+fn extract_excel_columns_with_header_row(range: &Range<Data>) -> (Vec<String>, usize) {
     // Smart matching: search first 5 rows for headers
     let max_rows = 5.min(range.height());
     let mut best_headers: Vec<String> = Vec::new();
     let mut best_score = 0;
+    let mut best_row_idx = 0;
 
     for row_idx in 0..max_rows {
         let mut headers = Vec::new();
@@ -262,6 +369,7 @@ fn extract_excel_columns(range: &Range<Data>) -> Vec<String> {
         if score > best_score && !headers.is_empty() {
             best_score = score;
             best_headers = headers;
+            best_row_idx = row_idx;
         }
     }
 
@@ -273,9 +381,10 @@ fn extract_excel_columns(range: &Range<Data>) -> Vec<String> {
                 .map(|cell| redact_nhs_numbers(cell.to_string().trim()))
                 .collect();
         }
+        best_row_idx = 0;
     }
 
-    best_headers
+    (best_headers, best_row_idx)
 }
 
 fn redact_nhs_numbers(text: &str) -> String {
