@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use calamine::{open_workbook_auto, Data, Reader, Range};
+use calamine::{open_workbook_auto, Data, Range, Reader};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use csv::ReaderBuilder;
@@ -79,7 +79,10 @@ fn main() -> Result<()> {
         .context(format!("Failed to create output file: {:?}", args.output))?;
     file.write_all(json.as_bytes())?;
 
-    println!("\nCompleted! Found {} directories with files.", entries.len());
+    println!(
+        "\nCompleted! Found {} directories with files.",
+        entries.len()
+    );
     println!("Output written to: {:?}", args.output);
 
     Ok(())
@@ -203,15 +206,10 @@ fn get_creation_time(path: &Path) -> Result<String> {
 }
 
 fn extract_csv_metadata(path: &Path) -> Result<CsvMetadata> {
-    let mut reader = ReaderBuilder::new()
-        .has_headers(true)
-        .from_path(path)?;
+    let mut reader = ReaderBuilder::new().has_headers(true).from_path(path)?;
 
     let headers = reader.headers()?.clone();
-    let columns: Vec<String> = headers
-        .iter()
-        .map(|h| redact_nhs_numbers(h))
-        .collect();
+    let columns: Vec<String> = headers.iter().map(redact_nhs_numbers).collect();
 
     let row_count = reader.records().count();
 
@@ -272,7 +270,7 @@ fn extract_excel_columns(range: &Range<Data>) -> Vec<String> {
         if let Some(first_row) = range.rows().next() {
             best_headers = first_row
                 .iter()
-                .map(|cell| redact_nhs_numbers(&cell.to_string().trim().to_string()))
+                .map(|cell| redact_nhs_numbers(cell.to_string().trim()))
                 .collect();
         }
     }
@@ -288,34 +286,34 @@ fn redact_nhs_numbers(text: &str) -> String {
     let re_spaced = Regex::new(r"\d{3}\s+\d{3}\s+\d{4}").unwrap();
 
     let mut result = text.to_string();
-    
+
     // First replace spaced format (more specific)
     result = re_spaced.replace_all(&result, "[REDACTED]").to_string();
-    
+
     // Then replace 10 consecutive digits
     // But filter out cases where they're part of longer numbers
     let mut final_result = String::new();
     let mut last_end = 0;
-    
+
     for mat in re_ten_digits.find_iter(&result) {
         let start = mat.start();
         let end = mat.end();
-        
+
         // Check if this digit sequence is isolated (not part of longer number)
         let before_ok = start == 0 || !result.as_bytes()[start - 1].is_ascii_digit();
         let after_ok = end >= result.len() || !result.as_bytes()[end].is_ascii_digit();
-        
+
         final_result.push_str(&result[last_end..start]);
-        
+
         if before_ok && after_ok {
             final_result.push_str("[REDACTED]");
         } else {
             final_result.push_str(mat.as_str());
         }
-        
+
         last_end = end;
     }
-    
+
     final_result.push_str(&result[last_end..]);
     final_result
 }
