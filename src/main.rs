@@ -234,7 +234,7 @@ fn build_similarity_table(directories: &[DirectoryEntry]) -> Vec<SimilarityHashE
     for dir_entry in directories {
         for file_details in &dir_entry.files {
             let file_path = format!("{}/{}", dir_entry.path, file_details.name);
-            
+
             // Collect CSV similarity hashes
             if let Some(csv_meta) = &file_details.csv_metadata {
                 let entry = hash_map
@@ -242,7 +242,7 @@ fn build_similarity_table(directories: &[DirectoryEntry]) -> Vec<SimilarityHashE
                     .or_insert_with(|| (Vec::new(), csv_meta.columns.clone()));
                 entry.0.push(file_path.clone());
             }
-            
+
             // Collect Excel similarity hashes (per sheet)
             if let Some(excel_meta) = &file_details.excel_metadata {
                 for sheet in &excel_meta.sheets {
@@ -260,13 +260,13 @@ fn build_similarity_table(directories: &[DirectoryEntry]) -> Vec<SimilarityHashE
     let mut similarity_table: Vec<SimilarityHashEntry> = hash_map
         .into_iter()
         .filter(|(_, (sources, _))| sources.len() > 1)  // Only show hashes with multiple sources
-        .map(|(hash, (sources, example_columns))| SimilarityHashEntry { 
-            hash, 
+        .map(|(hash, (sources, example_columns))| SimilarityHashEntry {
+            hash,
             example_columns,
-            sources 
+            sources
         })
         .collect();
-    
+
     similarity_table.sort_by_key(|entry| entry.hash);
     similarity_table
 }
@@ -277,7 +277,7 @@ fn build_crc32_table(directories: &[DirectoryEntry]) -> Vec<Crc32HashEntry> {
     for dir_entry in directories {
         for file_details in &dir_entry.files {
             let file_path = format!("{}/{}", dir_entry.path, file_details.name);
-            
+
             // Collect CRC32 hashes (only for files that have them)
             if let Some(crc32_hash) = &file_details.crc32_hash {
                 hash_map
@@ -294,7 +294,7 @@ fn build_crc32_table(directories: &[DirectoryEntry]) -> Vec<Crc32HashEntry> {
         .filter(|(_, sources)| sources.len() > 1)  // Only show hashes with multiple sources
         .map(|(hash, sources)| Crc32HashEntry { hash, sources })
         .collect();
-    
+
     crc32_table.sort_by(|a, b| a.hash.cmp(&b.hash));
     crc32_table
 }
@@ -302,16 +302,16 @@ fn build_crc32_table(directories: &[DirectoryEntry]) -> Vec<Crc32HashEntry> {
 fn build_fuzzy_similarity_groups(directories: &[DirectoryEntry], threshold: f64) -> Vec<FuzzySimilarityGroup> {
     // Collect all column sets with their sources
     let mut column_sets: Vec<(Vec<String>, String)> = Vec::new();
-    
+
     for dir_entry in directories {
         for file_details in &dir_entry.files {
             let file_path = format!("{}/{}", dir_entry.path, file_details.name);
-            
+
             // Collect CSV columns
             if let Some(csv_meta) = &file_details.csv_metadata {
                 column_sets.push((csv_meta.columns.clone(), file_path.clone()));
             }
-            
+
             // Collect Excel columns (per sheet)
             if let Some(excel_meta) = &file_details.excel_metadata {
                 for sheet in &excel_meta.sheets {
@@ -321,31 +321,31 @@ fn build_fuzzy_similarity_groups(directories: &[DirectoryEntry], threshold: f64)
             }
         }
     }
-    
+
     if column_sets.len() < 2 {
         return Vec::new();
     }
-    
+
     // Group similar column sets using clustering approach
     let mut groups: Vec<FuzzySimilarityGroup> = Vec::new();
     let mut used_indices: Vec<bool> = vec![false; column_sets.len()];
     let mut group_id = 0;
-    
+
     for i in 0..column_sets.len() {
         if used_indices[i] {
             continue;
         }
-        
+
         let mut group_sources = vec![column_sets[i].1.clone()];
         let mut group_columns = column_sets[i].0.clone();
         used_indices[i] = true;
-        
+
         // Find similar column sets
         for j in (i + 1)..column_sets.len() {
             if used_indices[j] {
                 continue;
             }
-            
+
             let similarity = calculate_column_set_similarity(&column_sets[i].0, &column_sets[j].0);
             if similarity >= threshold {
                 group_sources.push(column_sets[j].1.clone());
@@ -358,7 +358,7 @@ fn build_fuzzy_similarity_groups(directories: &[DirectoryEntry], threshold: f64)
                 used_indices[j] = true;
             }
         }
-        
+
         // Only create groups with multiple sources
         if group_sources.len() > 1 {
             group_columns.sort();
@@ -371,7 +371,7 @@ fn build_fuzzy_similarity_groups(directories: &[DirectoryEntry], threshold: f64)
             group_id += 1;
         }
     }
-    
+
     groups
 }
 
@@ -382,10 +382,10 @@ fn calculate_column_set_similarity(set1: &[String], set2: &[String]) -> f64 {
     if set1.is_empty() || set2.is_empty() {
         return 0.0;
     }
-    
+
     // Use Jaccard similarity as base, enhanced with fuzzy string matching
     let mut matches = 0;
-    
+
     for col1 in set1 {
         let mut best_match = 0.0;
         for col2 in set2 {
@@ -398,7 +398,7 @@ fn calculate_column_set_similarity(set1: &[String], set2: &[String]) -> f64 {
             matches += 1;
         }
     }
-    
+
     // Calculate fuzzy Jaccard: matches / union_size
     let union_size = set1.len() + set2.len() - matches;
     if union_size == 0 {
@@ -539,7 +539,7 @@ fn extract_csv_metadata(path: &Path, max_rows: usize) -> Result<CsvMetadata> {
 
     let mut row_count = 0;
     let mut stopped_at = None;
-    
+
     for record in reader.records() {
         if record.is_ok() {
             row_count += 1;
@@ -567,20 +567,20 @@ fn extract_excel_metadata(path: &Path, max_rows: usize) -> Result<ExcelMetadata>
     for sheet_name in workbook.sheet_names().to_vec() {
         if let Ok(range) = workbook.worksheet_range(&sheet_name) {
             let (columns, header_row_idx) = extract_excel_columns_with_header_row(&range);
-            
+
             // Calculate actual data rows (excluding header)
             let total_data_rows = if range.height() > header_row_idx + 1 {
                 range.height() - header_row_idx - 1
             } else {
                 0
             };
-            
+
             let (row_count, stopped_at) = if total_data_rows > max_rows {
                 (max_rows, Some(max_rows))
             } else {
                 (total_data_rows, None)
             };
-            
+
             let similarity_hash = calculate_column_similarity_hash(&columns);
 
             sheets.push(SheetMetadata {

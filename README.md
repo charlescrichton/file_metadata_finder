@@ -18,7 +18,7 @@ A Rust-based command-line tool that recursively scans directories to extract fil
   - CSV files: Extracts column names, row count, and column similarity hash
   - Excel files (.xlsx, .xls, .xlsm, .xlsb): Extracts per-sheet column names (with smart header detection in first 5 rows), row counts, and column similarity hash
   - PDF files: Detects and logs presence
-  - DOCX files: Detects and logs presence  
+  - DOCX files: Detects and logs presence
   - EML files: Detects and logs presence
 - **NHS Number redaction**: Automatically redacts 10-digit NHS numbers and numbers in `nnn nnn nnnn` format in:
   - File paths
@@ -44,17 +44,17 @@ A Rust-based command-line tool that recursively scans directories to extract fil
   - `walkdir` for directory traversal (read-only)
 
 ### What the tool does:
-✅ Reads file metadata (creation time, size)  
-✅ Reads file contents for hash calculation  
-✅ Parses CSV/Excel headers and row counts  
-✅ Creates a separate JSON output file  
+✅ Reads file metadata (creation time, size)
+✅ Reads file contents for hash calculation
+✅ Parses CSV/Excel headers and row counts
+✅ Creates a separate JSON output file
 
 ### What the tool never does:
-❌ Modifies any scanned files  
-❌ Deletes any files  
-❌ Creates files in scanned directories  
-❌ Changes file permissions or attributes  
-❌ Moves or renames files  
+❌ Modifies any scanned files
+❌ Deletes any files
+❌ Creates files in scanned directories
+❌ Changes file permissions or attributes
+❌ Moves or renames files
 
 The tool is designed for safe analysis of sensitive data environments where file integrity is paramount.
 
@@ -289,7 +289,7 @@ The tool produces a JSON file with the following structure:
       "similarity_score": 0.8,
       "representative_columns": [
         "cust_id",
-        "cust_name", 
+        "cust_name",
         "customer_id",
         "customer_name",
         "user_id",
@@ -489,7 +489,7 @@ The output includes a `fuzzy_similarity_groups` array that groups datasets with 
 
 Only supported file types are processed and included in the output:
 - **CSV files**: `.csv`
-- **Excel files**: `.xlsx`, `.xls`, `.xlsm`, `.xlsb` 
+- **Excel files**: `.xlsx`, `.xls`, `.xlsm`, `.xlsb`
 - **Document files**: `.pdf`, `.docx`, `.eml`
 
 Directories containing only unsupported file types are excluded from the output.
@@ -499,7 +499,7 @@ Directories containing only unsupported file types are excluded from the output.
 For CSV and Excel files, a `column_similarity_hash` is calculated to identify datasets with similar structure:
 
 1. Column names are converted to lowercase
-2. Non-alphanumeric characters are removed  
+2. Non-alphanumeric characters are removed
 3. Empty column names are filtered out
 4. Remaining column names are sorted alphabetically
 5. Names are concatenated with commas: `"col1,col2,col3"`
